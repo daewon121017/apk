@@ -183,12 +183,18 @@ class AndroidEngine:
         mp = self._MP()
         try:
             mp.setAudioStreamType(3)  # STREAM_MUSIC
-            mp.setWakeMode(self._ctx, 1)  # PARTIAL_WAKE_LOCK
-            hm = self._Map()
-            for k, v in (headers or {}).items():
-                if str(k).lower() != "accept-encoding":
-                    hm.put(str(k), str(v))
-            mp.setDataSource(self._ctx, self._Uri.parse(url), hm)
+            try:
+                mp.setWakeMode(self._ctx, 1)  # PARTIAL_WAKE_LOCK
+            except Exception:
+                pass
+            if str(url).startswith(("http://", "https://")):
+                hm = self._Map()
+                for k, v in (headers or {}).items():
+                    if str(k).lower() != "accept-encoding":
+                        hm.put(str(k), str(v))
+                mp.setDataSource(self._ctx, self._Uri.parse(url), hm)
+            else:  # 내려받은 로컬 파일
+                mp.setDataSource(str(url))
             mp.prepare()
         except Exception:
             self._release(mp)
@@ -280,7 +286,10 @@ class VlcEngine:
     def load(self, url, headers, still_valid):
         if not still_valid():
             return False
-        self.p.set_media(self.inst.media_new(url))
+        if os.path.exists(str(url)):
+            self.p.set_media(self.inst.media_new_path(url))
+        else:
+            self.p.set_media(self.inst.media_new(url))
         self.p.play()
         return True
 
@@ -649,7 +658,7 @@ class MusicApp(App):
         sv.add_widget(self.list_box)
         root.add_widget(sv)
 
-        self.w_status = lbl(self.status_text, 11, C(T.text_dim), size_hint_y=None, height=dp(20))
+        self.w_status = lbl(self.status_text, 11, C(T.text_dim), lines=2, size_hint_y=None, height=dp(34))
         root.add_widget(self.w_status)
         root.add_widget(lbl(CREDIT, 11, C(T.text_dim), halign="center", bold=True, size_hint_y=None, height=dp(20)))
 
@@ -849,21 +858,56 @@ class MusicApp(App):
         self.set_status("불러오는 중...")
         threading.Thread(target=self._resolve_and_play, args=(self.token, self.items[i]), daemon=True).start()
 
+    def _trim_cache(self, keep_path, keep=15):
+        """내려받은 음악 파일이 쌓이지 않게 오래된 것부터 지움"""
+        try:
+            d = os.path.join(self.data_dir, "cache")
+            files = [os.path.join(d, f) for f in os.listdir(d)]
+            files = [f for f in files if os.path.isfile(f) and f != keep_path]
+            files.sort(key=os.path.getmtime, reverse=True)
+            for f in files[keep - 1:]:
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _resolve_and_play(self, token, track):
+        cache = os.path.join(self.data_dir, "cache")
+        os.makedirs(cache, exist_ok=True)
+        last = [-10]
+
+        def hook(d):
+            if token != self.token:
+                raise RuntimeError("cancelled")  # 다른 곡을 눌렀으면 다운로드 중단
+            if d.get("status") == "downloading":
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                if total:
+                    pct = int(d.get("downloaded_bytes", 0) * 100 / total)
+                    if pct - last[0] >= 10:
+                        last[0] = pct
+                        self.set_status(f"불러오는 중... {pct}%")
+
         opts = {"format": "bestaudio[ext=m4a]/bestaudio/best", "quiet": True, "no_warnings": True,
-                "noplaylist": True, "cachedir": False, "socket_timeout": 15}
-        if ON_ANDROID:  # 안드로이드엔 JS 런타임이 없어서 JS가 필요 없는 클라이언트를 우선 사용
-            opts["extractor_args"] = {"youtube": {"player_client": ["android_vr", "tv"]}}
+                "noplaylist": True, "cachedir": False, "socket_timeout": 20, "retries": 5,
+                "outtmpl": os.path.join(cache, "%(id)s.%(ext)s"), "progress_hooks": [hook]}
         try:
             with yt_dlp.YoutubeDL(opts) as y:
-                info = y.extract_info(track.url, download=False)
+                info = y.extract_info(track.url, download=True)
+                path = y.prepare_filename(info)
+            if not os.path.exists(path):
+                raise RuntimeError("내려받은 파일을 찾지 못했어요")
             if token != self.token:
                 return
-            ok = self.engine.load(info["url"], info.get("http_headers") or {}, lambda: token == self.token)
+            os.utime(path, None)
+            ok = self.engine.load(path, {}, lambda: token == self.token)
             if ok:
                 self.on_started(token, info.get("duration"))
+                self._trim_cache(path)
         except Exception as e:
-            self.on_play_error(token, str(e)[:140])
+            if token == self.token:
+                self.on_play_error(token, f"{type(e).__name__}: {str(e)[:200]}")
 
     @mainthread
     def on_started(self, token, dur):
@@ -882,7 +926,7 @@ class MusicApp(App):
             return
         self.state = "idle"
         self.refresh_now()
-        self.set_status(f"⚠ 재생 실패: {msg}")
+        self.set_status(f"⚠ 재생 실패 - {msg}"[:230])
         if self.current + 1 < len(self.items):
             Clock.schedule_once(lambda dt: self.next_track(auto=True) if token == self.token else None, 1.5)
 
