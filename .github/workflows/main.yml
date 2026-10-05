@@ -34,7 +34,24 @@ jobs:
           pip install buildozer cython==0.29.37 virtualenv
 
       - name: Build APK
-        run: buildozer -v android debug
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Error summary (only when failed)
+        if: failure()
+        run: |
+          echo "===== ERROR LINES ====="
+          grep -n -i -E "error|failed|exception|not found|no such|traceback|command failed" build.log | grep -v -E "^[0-9]+:#\s+[A-Za-z_0-9]+ = " | tail -n 40 || true
+          echo "===== LAST LINES (env removed) ====="
+          grep -v -E "^#\s+[A-Za-z_0-9]+ = " build.log | tail -n 40 || true
+
+      - name: Upload full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
