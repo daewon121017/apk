@@ -252,6 +252,7 @@ class Backend:
         self.brain = None
         self.rev = -1
         self.fail = 0
+        self.why = ""
         threading.Thread(target=self._run, daemon=True).start()
 
     def send(self, cmd, **args):
@@ -277,6 +278,7 @@ class Backend:
             start_service(self.app.data_dir)
             return True
         except Exception as e:
+            self.why = f"[시작실패 {type(e).__name__}: {str(e)[:120]}]"
             core.log(self.app.data_dir, f"start_service fail: {e}")
             return False
 
@@ -303,19 +305,19 @@ class Backend:
             self.mode = "service"
             return
         self.app.set_status("재생 서비스 시작 중...")
-        if self._launch() and self._wait_service(10):
+        if self._launch() and self._wait_service(30):
             self.mode = "service"
             return
-        self._go_local()
+        self._go_local(self.why or ("[응답없음] " + core.log_tail(self.app.data_dir)))
 
     def _reconnect(self):
         self.app.set_status("재생 서비스 다시 연결하는 중...")
         self._launch()
-        if self._wait_service(10):
+        if self._wait_service(30):
             self.fail = 0
             self.app.set_status("재생 서비스에 다시 연결됐어요")
         else:
-            self._go_local()
+            self._go_local("[재연결 실패] " + core.log_tail(self.app.data_dir))
 
     def _call(self, cmd, args):
         if self.mode == "local":

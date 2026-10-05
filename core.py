@@ -23,6 +23,14 @@ except Exception:
     pass
 
 
+def log_tail(data_dir, n=3):
+    try:
+        with open(os.path.join(data_dir, "service.log"), "r", encoding="utf-8") as f:
+            return " | ".join(f.read().strip().splitlines()[-n:])
+    except Exception:
+        return ""
+
+
 def log(data_dir, msg):
     """service.log 에 한 줄 남김 (문제 생겼을 때 원인 찾기용)"""
     try:
@@ -335,6 +343,9 @@ class Brain:
         os.makedirs(self.cache_dir, exist_ok=True)
         self.engine = engine
         self.yt = ytdlp
+        self.yt_ready = threading.Event()
+        if ytdlp is not None:
+            self.yt_ready.set()
         self.on_change = on_change or (lambda: None)
         self.lock = threading.RLock()
         self.items = []
@@ -614,6 +625,8 @@ class Brain:
 
     def _download(self, track, token=None):
         """yt-dlp 로 오디오를 내려받아 로컬 파일 경로를 돌려줌 (같은 곡은 한 번만)"""
+        if self.yt is None:
+            self.yt_ready.wait(60)  # 서비스가 yt-dlp 를 아직 불러오는 중일 수 있음
         if self.yt is None:
             raise RuntimeError("yt-dlp 를 불러오지 못했어요")
         key = track.url

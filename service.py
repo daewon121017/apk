@@ -181,9 +181,17 @@ def main():
         if n:
             n.refresh()
 
-    yt = core.load_ytdlp(os.path.join(data_dir, "ytdlp"))
     engine = core.make_engine(True)
-    brain = core.Brain(data_dir, engine, yt, on_change=on_change)
+    brain = core.Brain(data_dir, engine, None, on_change=on_change)
+
+    def load_yt():  # yt-dlp 는 불러오는 데 오래 걸려서 뒤에서 따로 (서비스는 먼저 열어 둠)
+        try:
+            brain.yt = core.load_ytdlp(os.path.join(data_dir, "ytdlp"))
+        except Exception:
+            core.log(data_dir, "yt-dlp load fail:\n" + traceback.format_exc())
+        brain.yt_ready.set()
+        core.log(data_dir, "yt-dlp loaded: %s" % (brain.yt is not None))
+    threading.Thread(target=load_yt, daemon=True).start()
 
     def shutdown():
         core.log(data_dir, "service shutdown")
@@ -205,6 +213,9 @@ def main():
             pass
         threading.Timer(2.0, lambda: os._exit(0)).start()
 
+    core.CommandServer(brain, data_dir, lambda: threading.Timer(0.3, shutdown).start())
+    core.log(data_dir, "service ready")
+
     try:
         notifier = Notifier(brain, data_dir, shutdown)
         holder["notifier"] = notifier
@@ -213,8 +224,6 @@ def main():
         core.log(data_dir, "notifier init fail:\n" + traceback.format_exc())
         brain.set_status(f"⚠ 알림 만들기 실패: {type(e).__name__} (재생은 정상)")
 
-    core.CommandServer(brain, data_dir, lambda: threading.Timer(0.3, shutdown).start())
-    core.log(data_dir, "service ready")
     while True:
         time.sleep(30)
 
