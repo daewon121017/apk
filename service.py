@@ -11,12 +11,13 @@ import time
 import traceback
 
 CHANNEL_ID = "mymusic_playback"
-NOTIF_ID = 1  # p4a 포그라운드 서비스가 쓰는 번호와 같게 해서 알림이 하나만 뜨게 함
+NOTIF_ID = 4242  # p4a 기본 알림("Player")과 다른 번호 → startForeground 로 교체되어 기본 알림은 사라짐
 
 
 class Notifier:
     def __init__(self, brain, data_dir, on_close):
         from jnius import autoclass, cast
+        self.autoclass = autoclass
         self.brain = brain
         self.data_dir = data_dir
         self.on_close = on_close
@@ -45,6 +46,20 @@ class Notifier:
             except Exception:
                 pass
             self.nm.createNotificationChannel(ch)
+
+        self.art_cache = {}   # 썸네일 url -> Bitmap
+        self.art_loading = set()
+        self.session = None
+        try:  # 삼성/안드로이드 "미디어" 패널과 잠금화면에 제대로 뜨게 하는 미디어 세션
+            MediaSession = autoclass("android.media.session.MediaSession")
+            self.session = MediaSession(self.svc, "MyMusic")
+            self.session.setActive(True)
+            self.PS = autoclass("android.media.session.PlaybackState")
+            self.PSB = autoclass("android.media.session.PlaybackState$Builder")
+            self.MMB = autoclass("android.media.MediaMetadata$Builder")
+        except Exception:
+            self.session = None
+            self._log("media session fail:\n" + traceback.format_exc())
 
         self.A_PREV = self.pkg + ".MUSIC_PREV"
         self.A_TOGGLE = self.pkg + ".MUSIC_TOGGLE"
@@ -99,7 +114,32 @@ class Notifier:
         li.setFlags(self.Intent.FLAG_ACTIVITY_NEW_TASK | self.Intent.FLAG_ACTIVITY_SINGLE_TOP)
         return self.PendingIntent.getActivity(self.svc, 0, li, self._flags())
 
-    def _build(self, title, text, playing):
+    def _update_session(self, snap, playing, bmp):
+        if self.session is None:
+            return
+        try:
+            md = self.MMB()
+            md.putString("android.media.metadata.TITLE", snap["title"] or "My Music")
+            md.putString("android.media.metadata.ARTIST", snap["channel"] or "")
+            if snap.get("dur"):
+                md.putLong("android.media.metadata.DURATION", int(snap["dur"]))
+            if bmp is not None:
+                md.putBitmap("android.media.metadata.ALBUM_ART", bmp)
+            self.session.setMetadata(md.build())
+            PS = self.PS
+            st = snap["state"]
+            code = PS.STATE_PLAYING if playing else (
+                PS.STATE_BUFFERING if st == "loading" else (PS.STATE_PAUSED if snap["title"] else PS.STATE_NONE))
+            acts = (PS.ACTION_PLAY | PS.ACTION_PAUSE | PS.ACTION_PLAY_PAUSE |
+                    PS.ACTION_SKIP_TO_NEXT | PS.ACTION_SKIP_TO_PREVIOUS)
+            b = self.PSB()
+            b.setActions(acts)
+            b.setState(code, int(snap.get("pos") or 0), 1.0 if playing else 0.0)
+            self.session.setPlaybackState(b.build())
+        except Exception:
+            self._log("session update error:\n" + traceback.format_exc())
+
+    def _build(self, snap, title, text, playing, bmp):
         b = self.Builder(self.svc, CHANNEL_ID) if self.sdk >= 26 else self.Builder(self.svc)
         icon = self.svc.getApplicationInfo().icon or self.R.ic_media_play
         b.setSmallIcon(icon)
@@ -109,6 +149,11 @@ class Notifier:
         b.setOngoing(True)
         b.setOnlyAlertOnce(True)
         b.setShowWhen(False)
+        if bmp is not None:
+            try:
+                b.setLargeIcon(bmp)
+            except Exception:
+                pass
         try:
             b.setVisibility(1)  # 잠금화면에도 표시
         except Exception:
@@ -119,16 +164,34 @@ class Notifier:
         b.addAction(self.R.ic_media_next, "다음", self._action_pi(self.A_NEXT, 13))
         b.addAction(self.R.ic_menu_close_clear_cancel, "닫기", self._action_pi(self.A_CLOSE, 14))
         try:
-            from jnius import autoclass
-            style = autoclass("android.app.Notification$MediaStyle")()
+            style = self.autoclass("android.app.Notification$MediaStyle")()
+            if self.session is not None:
+                style.setMediaSession(self.session.getSessionToken())
             try:
                 style.setShowActionsInCompactView([0, 1, 2])
             except Exception:
                 pass
             b.setStyle(style)
         except Exception:
-            pass
+            self._log("style fail:\n" + traceback.format_exc())
         return b.build()
+
+    def _fetch_art(self, url):
+        """썸네일을 뒤에서 받아와 Bitmap 으로 만든 뒤 알림을 다시 그림"""
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            data = urllib.request.urlopen(req, timeout=10).read()
+            BF = self.autoclass("android.graphics.BitmapFactory")
+            bmp = BF.decodeByteArray(data, 0, len(data))
+            if bmp is not None:
+                self.art_cache[url] = bmp
+        except Exception:
+            self.art_cache[url] = None
+            self._log("art fetch fail:\n" + traceback.format_exc())
+        finally:
+            self.art_loading.discard(url)
+        self.refresh(force=True)
 
     def refresh(self, force=False):
         try:
@@ -142,19 +205,28 @@ class Notifier:
             else:
                 text = s["status"] or "재생할 곡을 골라 주세요"
             playing = state == "playing"
-            key = (state, title, text)
+            url = s.get("thumb") or ""
+            bmp = self.art_cache.get(url) if url else None
+            if url and url not in self.art_cache and url not in self.art_loading:
+                self.art_loading.add(url)
+                threading.Thread(target=self._fetch_art, args=(url,), daemon=True).start()
+            key = (state, title, text, bmp is not None)
             with self.lock:
                 if key == self.last_key and not force:
                     return
                 self.last_key = key
-                n = self._build(title, text, playing)
-                if not self.started:
-                    self.svc.startForeground(NOTIF_ID, n)
-                    self.started = True
-                else:
-                    self.nm.notify(NOTIF_ID, n)
-        except Exception:
-            self._log("notify error:\n" + traceback.format_exc())
+                self._update_session(s, playing, bmp)
+                n = self._build(s, title, text, playing, bmp)
+                # 항상 startForeground 로 올려서 p4a 기본 알림("Player")을 우리 알림으로 교체
+                self.svc.startForeground(NOTIF_ID, n)
+                self.started = True
+        except Exception as e:
+            err = traceback.format_exc()
+            self._log("notify error:\n" + err)
+            try:
+                self.brain.set_status(f"⚠ 알림 오류: {type(e).__name__} {str(e)[:120]}")
+            except Exception:
+                pass
 
     def remove(self):
         try:
@@ -163,6 +235,12 @@ class Notifier:
             pass
         try:
             self.nm.cancel(NOTIF_ID)
+        except Exception:
+            pass
+        try:
+            if self.session is not None:
+                self.session.setActive(False)
+                self.session.release()
         except Exception:
             pass
 
