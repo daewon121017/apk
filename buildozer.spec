@@ -9,11 +9,13 @@ version = 1.0
 # yt-dlp 는 순수 파이썬이라 그대로 포함돼요
 requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.1,pyjnius,android,yt-dlp,certifi,openssl,sqlite3
 
+services = player:service.py:foreground:sticky
+
 orientation = portrait
 fullscreen = 0
 
-android.permissions = INTERNET,WAKE_LOCK,FOREGROUND_SERVICE
-android.api = 34
+android.permissions = INTERNET,WAKE_LOCK,FOREGROUND_SERVICE,POST_NOTIFICATIONS
+android.api = 33
 android.minapi = 24
 android.archs = arm64-v8a
 android.accept_sdk_license = True

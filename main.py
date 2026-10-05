@@ -1,6 +1,9 @@
 """
 🎵 My Music Player — Android 버전 (Kivy)
 
+구조: main.py(화면 = 리모컨)  ←→  service.py(백그라운드 서비스 = 실제 재생/대기열/알림)
+      core.py 는 둘이 같이 쓰는 재생 두뇌.  화면을 꺼도 서비스가 계속 다음 곡을 재생해요.
+
 - 폰에서: APK로 빌드해서 설치 (README.md 참고)
 - PC에서 UI 미리보기: pip install kivy yt-dlp python-vlc pillow  →  python main.py
   (PC에서는 VLC 프로그램이 설치되어 있으면 소리도 나와요)
@@ -10,20 +13,18 @@
 """
 import json
 import os
-import random
+import queue
 import shutil
 import sys
 import threading
+import time
 import urllib.request
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from types import SimpleNamespace
 
-try:  # 안드로이드에서 https 인증서 인식용
-    import certifi
-    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
-except Exception:
-    pass
+import core  # 재생 두뇌 (service.py 와 공용)
+from core import Track, track_from_dict, tracks_from_info, ytdlp_version
 
 from kivy.app import App
 from kivy.clock import Clock, mainthread
@@ -95,6 +96,7 @@ T = SimpleNamespace(**THEMES[DEFAULT_THEME])
 WHITE = (1, 1, 1, 1)
 
 
+
 def fmt_time(sec):
     if not sec or sec < 0:
         return "0:00"
@@ -102,245 +104,6 @@ def fmt_time(sec):
     h, rem = divmod(sec, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-
-@dataclass
-class Track:
-    title: str
-    url: str
-    channel: str = ""
-    duration: int = 0
-    thumb: str = ""
-
-
-def tracks_from_info(info):
-    entries = info.get("entries") or [info]
-    tracks = []
-    for e in entries:
-        if not e:
-            continue
-        vid = e.get("id")
-        url = e.get("webpage_url") or e.get("url") or ""
-        if not url.startswith("http"):
-            if not vid:
-                continue
-            url = f"https://www.youtube.com/watch?v={vid}"
-        thumb = e.get("thumbnail") or ""
-        if "youtube.com" in url or "youtu.be" in url:
-            thumb = f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg" if vid else thumb
-        tracks.append(Track(
-            title=e.get("title") or "제목 없음", url=url,
-            channel=e.get("channel") or e.get("uploader") or "",
-            duration=int(e.get("duration") or 0), thumb=thumb))
-    return tracks
-
-
-# ───────────── yt-dlp 로드 (업데이트본 우선) ─────────────
-def load_ytdlp(update_dir):
-    global yt_dlp
-    upd = os.path.join(update_dir, "yt-dlp")
-    if os.path.isfile(upd):
-        sys.path.insert(0, upd)
-        try:
-            import yt_dlp as mod
-            yt_dlp = mod
-            return
-        except Exception:
-            sys.path.remove(upd)
-            for k in [k for k in sys.modules if k == "yt_dlp" or k.startswith("yt_dlp.")]:
-                del sys.modules[k]
-    try:
-        import yt_dlp as mod
-        yt_dlp = mod
-    except Exception:
-        yt_dlp = None
-
-
-def ytdlp_version():
-    try:
-        from yt_dlp.version import __version__
-        return __version__
-    except Exception:
-        return "?"
-
-
-# ───────────── 재생 엔진 ─────────────
-class AndroidEngine:
-    """안드로이드 내장 MediaPlayer (pyjnius)"""
-
-    def __init__(self):
-        from jnius import autoclass
-        self._MP = autoclass("android.media.MediaPlayer")
-        self._Uri = autoclass("android.net.Uri")
-        self._Map = autoclass("java.util.HashMap")
-        self._ctx = autoclass("org.kivy.android.PythonActivity").mActivity
-        self.mp = None
-        self.user_paused = False
-        self._lock = threading.Lock()
-
-    def load(self, url, headers, still_valid):
-        """블로킹 호출 — 반드시 작업 스레드에서."""
-        mp = self._MP()
-        try:
-            mp.setAudioStreamType(3)  # STREAM_MUSIC
-            try:
-                mp.setWakeMode(self._ctx, 1)  # PARTIAL_WAKE_LOCK
-            except Exception:
-                pass
-            if str(url).startswith(("http://", "https://")):
-                hm = self._Map()
-                for k, v in (headers or {}).items():
-                    if str(k).lower() != "accept-encoding":
-                        hm.put(str(k), str(v))
-                mp.setDataSource(self._ctx, self._Uri.parse(url), hm)
-            else:  # 내려받은 로컬 파일
-                mp.setDataSource(str(url))
-            mp.prepare()
-        except Exception:
-            self._release(mp)
-            raise
-        if not still_valid():
-            self._release(mp)
-            return False
-        with self._lock:
-            old, self.mp = self.mp, mp
-            self.user_paused = False
-        self._release(old)
-        mp.start()
-        return True
-
-    @staticmethod
-    def _release(mp):
-        if mp is not None:
-            try:
-                mp.release()
-            except Exception:
-                pass
-
-    def pause(self):
-        try:
-            if self.mp:
-                self.mp.pause()
-                self.user_paused = True
-        except Exception:
-            pass
-
-    def resume(self):
-        try:
-            if self.mp:
-                self.mp.start()
-                self.user_paused = False
-        except Exception:
-            pass
-
-    def seek(self, ms):
-        try:
-            if self.mp:
-                self.mp.seekTo(int(ms))
-        except Exception:
-            pass
-
-    def position(self):
-        try:
-            return max(self.mp.getCurrentPosition(), 0) if self.mp else 0
-        except Exception:
-            return 0
-
-    def duration(self):
-        try:
-            return max(self.mp.getDuration(), 0) if self.mp else 0
-        except Exception:
-            return 0
-
-    def stop(self):
-        with self._lock:
-            old, self.mp = self.mp, None
-        self._release(old)
-
-    def state(self):
-        mp = self.mp
-        if not mp:
-            return "idle"
-        try:
-            if mp.isPlaying():
-                return "playing"
-            if self.user_paused:
-                return "paused"
-            dur, pos = mp.getDuration(), mp.getCurrentPosition()
-            if dur > 0 and pos >= dur - 1500:
-                return "ended"
-            return "playing"  # 버퍼링 중
-        except Exception:
-            return "error"
-
-
-class VlcEngine:
-    """PC 테스트용 (python-vlc)"""
-
-    def __init__(self):
-        import vlc
-        self.vlc = vlc
-        self.inst = vlc.Instance("--no-video", "--quiet")
-        self.p = self.inst.media_player_new()
-
-    def load(self, url, headers, still_valid):
-        if not still_valid():
-            return False
-        if os.path.exists(str(url)):
-            self.p.set_media(self.inst.media_new_path(url))
-        else:
-            self.p.set_media(self.inst.media_new(url))
-        self.p.play()
-        return True
-
-    def pause(self):
-        self.p.set_pause(1)
-
-    def resume(self):
-        self.p.set_pause(0)
-
-    def seek(self, ms):
-        self.p.set_time(int(ms))
-
-    def position(self):
-        return max(self.p.get_time(), 0)
-
-    def duration(self):
-        return max(self.p.get_length(), 0)
-
-    def stop(self):
-        self.p.stop()
-
-    def state(self):
-        s, V = self.p.get_state(), self.vlc.State
-        if s == V.Ended:
-            return "ended"
-        if s == V.Error:
-            return "error"
-        if s == V.Paused:
-            return "paused"
-        return "playing"
-
-
-class NullEngine:
-    def load(self, *a, **k):
-        raise RuntimeError("재생 엔진이 없어요 (PC 테스트: pip install python-vlc + VLC 설치)")
-
-    def pause(self): pass
-    def resume(self): pass
-    def seek(self, ms): pass
-    def position(self): return 0
-    def duration(self): return 0
-    def stop(self): pass
-    def state(self): return "idle"
-
-
-def make_engine():
-    try:
-        return AndroidEngine() if ON_ANDROID else VlcEngine()
-    except Exception as e:
-        print("engine error:", e)
-        return NullEngine()
 
 
 # ───────────── 커스텀 위젯 ─────────────
@@ -469,6 +232,118 @@ class SeekSlider(Slider):
         return res
 
 
+# ───────────── 서비스 / 백엔드 ─────────────
+def start_service(data_dir):
+    """백그라운드 재생 서비스 시작 (이미 켜져 있으면 그대로 둠)"""
+    from jnius import autoclass
+    act = autoclass("org.kivy.android.PythonActivity").mActivity
+    cls = autoclass(act.getPackageName() + ".ServicePlayer")
+    cls.start(act, data_dir)
+
+
+class Backend:
+    """서비스(없으면 앱 안의 두뇌)에 명령을 보내고 최신 상태를 받아오는 일꾼 스레드.
+    명령이 없을 때는 0.5초마다 상태를 물어봐서 화면을 갱신한다."""
+
+    def __init__(self, app):
+        self.app = app
+        self.q = queue.Queue()
+        self.mode = "connecting"  # connecting / service / local
+        self.brain = None
+        self.rev = -1
+        self.fail = 0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def send(self, cmd, **args):
+        self.q.put((cmd, args))
+
+    def deliver(self, snap):
+        if "items" in snap:
+            self.rev = snap["rev"]
+            self.app.incoming_items = (snap["rev"], snap["items"])
+        self.app.incoming_snap = snap
+        self.app.schedule_apply()
+
+    def _try_rpc(self):
+        try:
+            self.rev = -1
+            self.deliver(core.rpc(self.app.data_dir, "snap", rev=-1))
+            return True
+        except Exception:
+            return False
+
+    def _launch(self):
+        try:
+            start_service(self.app.data_dir)
+            return True
+        except Exception as e:
+            core.log(self.app.data_dir, f"start_service fail: {e}")
+            return False
+
+    def _wait_service(self, seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            if self._try_rpc():
+                return True
+            time.sleep(0.25)
+        return False
+
+    def _go_local(self, why=""):
+        engine = core.make_engine(ON_ANDROID)
+        self.brain = core.Brain(self.app.data_dir, engine, yt_dlp)
+        self.mode = "local"
+        self.rev = -1
+        if ON_ANDROID:
+            self.app.set_status("⚠ 백그라운드 서비스 연결 실패 - 앱 안에서 재생해요 (화면을 끄면 끊길 수 있어요) " + why)
+
+    def _connect(self):
+        if not ON_ANDROID:
+            return self._go_local()
+        if self._try_rpc():
+            self.mode = "service"
+            return
+        self.app.set_status("재생 서비스 시작 중...")
+        if self._launch() and self._wait_service(10):
+            self.mode = "service"
+            return
+        self._go_local()
+
+    def _reconnect(self):
+        self.app.set_status("재생 서비스 다시 연결하는 중...")
+        self._launch()
+        if self._wait_service(10):
+            self.fail = 0
+            self.app.set_status("재생 서비스에 다시 연결됐어요")
+        else:
+            self._go_local()
+
+    def _call(self, cmd, args):
+        if self.mode == "local":
+            return self.brain.handle({"cmd": cmd, "args": args, "rev": self.rev})
+        return core.rpc(self.app.data_dir, cmd, args, rev=self.rev)
+
+    def _run(self):
+        try:
+            self._connect()
+        except Exception as e:
+            core.log(self.app.data_dir, f"connect error: {e}")
+            self._go_local()
+        while True:
+            try:
+                cmd, args = self.q.get(timeout=0.5)
+            except queue.Empty:
+                cmd, args = "snap", {}
+            try:
+                self.deliver(self._call(cmd, args))
+                self.fail = 0
+            except Exception as e:
+                self.fail += 1
+                core.log(self.app.data_dir, f"call fail({cmd}) #{self.fail}: {e}")
+                if self.mode == "service" and self.fail >= 3:
+                    self._reconnect()
+                time.sleep(0.3)
+
+
 # ───────────── 앱 ─────────────
 class MusicApp(App):
     title = "My Music"
@@ -477,30 +352,35 @@ class MusicApp(App):
         self.data_dir = self.user_data_dir
         os.makedirs(self.data_dir, exist_ok=True)
         self.settings_path = os.path.join(self.data_dir, "settings.json")
-        self.queue_path = os.path.join(self.data_dir, "queue.json")
         self.ytdlp_dir = os.path.join(self.data_dir, "ytdlp")
-        load_ytdlp(self.ytdlp_dir)
+        global yt_dlp
+        yt_dlp = core.load_ytdlp(self.ytdlp_dir)
 
         self.settings = self._load_json(self.settings_path, {})
         name = self.settings.get("theme")
         self.theme_name = name if name in THEMES else DEFAULT_THEME
         T.__dict__.update(THEMES[self.theme_name])
 
-        self.engine = make_engine()
+        # 서비스가 알려 주는 재생 상태 (화면은 보여 주기만 함)
         self.items = []
+        self.items_rev = None
         self.results = []
         self.current = -1
         self.state = "idle"  # idle / loading / playing / paused
-        self.token = 0
         self.shuffle = False
         self.repeat = 0  # 0 끔, 1 전체, 2 한곡
         self.view = "queue"
         self.status_text = ""
         self.input_text = ""
-        self._load_queue()
+        self.incoming_snap = None
+        self.incoming_items = None
+        self._apply_pending = False
+        self._srv_status = None
+        self._toggle_sig = None
 
         if ON_ANDROID:
             Window.softinput_mode = "below_target"
+            self._ask_notification_permission()
         else:
             Window.size = (400, 780)
         Window.bind(on_keyboard=self.on_key)
@@ -512,8 +392,18 @@ class MusicApp(App):
             self.set_status("⚠ yt-dlp 를 불러오지 못했어요")
         else:
             self.set_status(f"제목이나 URL을 입력하세요 (yt-dlp {ytdlp_version()})")
-        Clock.schedule_interval(self.tick, 0.25)
+        self.be = Backend(self)
         return self.root_box
+
+    def _ask_notification_permission(self):
+        """안드로이드 13+ : 알림창 컨트롤을 보이려면 알림 허용이 필요"""
+        try:
+            from jnius import autoclass
+            if autoclass("android.os.Build$VERSION").SDK_INT >= 33:
+                from android.permissions import request_permissions
+                request_permissions(["android.permission.POST_NOTIFICATIONS"])
+        except Exception as e:
+            print("notification permission:", e)
 
     # ── 저장 ──
     @staticmethod
@@ -531,27 +421,24 @@ class MusicApp(App):
         except Exception:
             pass
 
-    def _load_queue(self):
-        try:
-            self.items = [Track(**d) for d in self._load_json(self.queue_path, [])]
-        except Exception:
-            self.items = []
-
-    def save_queue(self):
-        self._save_json(self.queue_path, [asdict(t) for t in self.items])
-
     # ── 시스템 이벤트 ──
     def on_pause(self):
-        return True  # 백그라운드에서도 앱 유지(음악 계속)
+        return True  # 화면이 가려져도 앱 유지 (실제 음악은 서비스가 재생)
 
     def on_resume(self):
         pass
 
     def on_stop(self):
-        self.engine.stop()
+        # 서비스가 재생 중이므로 멈추지 않는다. (서비스 연결이 안 돼서 앱 안에서 재생 중일 때만 정지)
+        be = getattr(self, "be", None)
+        if be is not None and be.mode == "local" and be.brain is not None:
+            try:
+                be.brain.cmd_stop()
+            except Exception:
+                pass
 
     def on_key(self, window, key, *args):
-        if key == 27 and ON_ANDROID:  # 뒤로가기 → 앱 종료 대신 백그라운드로
+        if key == 27 and ON_ANDROID:  # 뒤로가기 → 앱 종료 대신 백그라운드로 (음악 계속)
             try:
                 from jnius import autoclass
                 autoclass("org.kivy.android.PythonActivity").mActivity.moveTaskToBack(True)
@@ -560,7 +447,84 @@ class MusicApp(App):
                 return False
         return False
 
+    # ── 서비스가 보내준 상태 반영 ──
+    def schedule_apply(self):
+        if self._apply_pending:
+            return
+        self._apply_pending = True
+        self._apply_main()
+
+    @mainthread
+    def _apply_main(self):
+        self._apply_pending = False
+        s = self.incoming_snap
+        if not s:
+            return
+        inc = self.incoming_items
+        items_changed = False
+        if inc is not None and inc[0] != self.items_rev:
+            self.items = [track_from_dict(d) for d in inc[1]]
+            self.items_rev = inc[0]
+            items_changed = True
+        old_cur, old_state = self.current, self.state
+        self.current, self.state = s["current"], s["state"]
+        self.shuffle, self.repeat = s["shuffle"], s["repeat"]
+        sig = (self.shuffle, self.repeat)
+        if sig != self._toggle_sig:
+            self._toggle_sig = sig
+            self.style_toggles()
+        if items_changed or old_cur != self.current:
+            self.refresh_list()
+        if items_changed or old_cur != self.current or old_state != self.state:
+            self.refresh_now()
+        pos, dur = s.get("pos", 0), s.get("dur", 0)
+        if dur > 0 and self.state in ("playing", "paused") and not self.w_seek.dragging:
+            self.w_seek.value = min(pos / dur, 1)
+            self.w_cur.text = fmt_time(pos / 1000)
+            self.w_total.text = fmt_time(dur / 1000)
+        st = s.get("status", "")
+        if st != self._srv_status:
+            self._srv_status = st
+            if st:
+                self.set_status(st)
+
+    # ── 명령 (실제 처리는 서비스가 함) ──
+    def play_index(self, i):
+        self.be.send("play", i=i)
+
+    def add_tracks(self, tracks, play=False):
+        if not tracks:
+            self.set_status("⚠ 추가할 곡이 없어요")
+            return
+        self.be.send("add", tracks=[asdict(t) for t in tracks], play=play)
+
+    def move(self, i, d):
+        self.be.send("move", i=i, d=d)
+
+    def remove(self, i):
+        self.be.send("remove", i=i)
+
+    def toggle_play(self):
+        self.be.send("toggle")
+
+    def next_track(self):
+        self.be.send("next")
+
+    def prev_track(self):
+        self.be.send("prev")
+
+    def toggle_shuffle(self, *a):
+        self.be.send("shuffle")
+
+    def toggle_repeat(self, *a):
+        self.be.send("repeat")
+
+    def on_seek(self, value):
+        if self.state in ("playing", "paused"):
+            self.be.send("seek", f=value)
+
     # ── UI ──
+
     def build_ui(self):
         if getattr(self, "w_input", None) is not None:
             self.input_text = self.w_input.text
@@ -685,6 +649,7 @@ class MusicApp(App):
         self.btn_repeat.set_colors(*on(self.repeat))
         self.btn_repeat.label.text = ("한곡" if self.repeat == 2 else "반복")
 
+
     @mainthread
     def set_status(self, text):
         self.status_text = text
@@ -703,6 +668,7 @@ class MusicApp(App):
             self.w_total.text = self.w_cur.text = "0:00"
             self.w_seek.value = 0
         self.w_play.set_icon("pause" if self.state == "playing" else "play")
+
 
     # ── 목록 ──
     def refresh_list(self):
@@ -765,7 +731,7 @@ class MusicApp(App):
         row.add_widget(a)
         return row
 
-    # ── 검색 / 추가 ──
+
     def submit(self, *a):
         text = self.w_input.text.strip()
         if not text:
@@ -804,220 +770,6 @@ class MusicApp(App):
     def on_added(self, tracks):
         self.add_tracks(tracks)
 
-    def add_tracks(self, tracks, play=False):
-        if not tracks:
-            self.set_status("⚠ 추가할 곡이 없어요")
-            return
-        first_new = len(self.items)
-        self.items.extend(tracks)
-        self.save_queue()
-        self.refresh_list()
-        self.set_status(f"추가됨: {tracks[0].title[:30]}" + (f" 외 {len(tracks) - 1}곡" if len(tracks) > 1 else ""))
-        if play or (self.state == "idle" and self.current == -1):
-            self.play_index(first_new)
-
-    def move(self, i, d):
-        j = i + d
-        if not (0 <= j < len(self.items)):
-            return
-        self.items[i], self.items[j] = self.items[j], self.items[i]
-        if self.current == i:
-            self.current = j
-        elif self.current == j:
-            self.current = i
-        self.save_queue()
-        self.refresh_list()
-
-    def remove(self, i):
-        self.items.pop(i)
-        self.save_queue()
-        if i < self.current:
-            self.current -= 1
-        elif i == self.current:
-            self.stop()
-            self.current = -1
-            self.refresh_list()
-            if i < len(self.items):
-                self.play_index(i)
-            return
-        self.refresh_list()
-
-    # ── 재생 ──
-    def play_index(self, i):
-        if not (0 <= i < len(self.items)):
-            return
-        if yt_dlp is None:
-            self.set_status("⚠ yt-dlp 가 없어요")
-            return
-        self.engine.stop()
-        self.current = i
-        self.token += 1
-        self.state = "loading"
-        self.refresh_now()
-        self.refresh_list()
-        self.set_status("불러오는 중...")
-        threading.Thread(target=self._resolve_and_play, args=(self.token, self.items[i]), daemon=True).start()
-
-    def _trim_cache(self, keep_path, keep=15):
-        """내려받은 음악 파일이 쌓이지 않게 오래된 것부터 지움"""
-        try:
-            d = os.path.join(self.data_dir, "cache")
-            files = [os.path.join(d, f) for f in os.listdir(d)]
-            files = [f for f in files if os.path.isfile(f) and f != keep_path]
-            files.sort(key=os.path.getmtime, reverse=True)
-            for f in files[keep - 1:]:
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    def _resolve_and_play(self, token, track):
-        cache = os.path.join(self.data_dir, "cache")
-        os.makedirs(cache, exist_ok=True)
-        last = [-10]
-
-        def hook(d):
-            if token != self.token:
-                raise RuntimeError("cancelled")  # 다른 곡을 눌렀으면 다운로드 중단
-            if d.get("status") == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-                if total:
-                    pct = int(d.get("downloaded_bytes", 0) * 100 / total)
-                    if pct - last[0] >= 10:
-                        last[0] = pct
-                        self.set_status(f"불러오는 중... {pct}%")
-
-        opts = {"format": "bestaudio[ext=m4a]/bestaudio/best", "quiet": True, "no_warnings": True,
-                "noplaylist": True, "cachedir": False, "socket_timeout": 20, "retries": 5,
-                "outtmpl": os.path.join(cache, "%(id)s.%(ext)s"), "progress_hooks": [hook]}
-        try:
-            with yt_dlp.YoutubeDL(opts) as y:
-                info = y.extract_info(track.url, download=True)
-                path = y.prepare_filename(info)
-            if not os.path.exists(path):
-                raise RuntimeError("내려받은 파일을 찾지 못했어요")
-            if token != self.token:
-                return
-            os.utime(path, None)
-            ok = self.engine.load(path, {}, lambda: token == self.token)
-            if ok:
-                self.on_started(token, info.get("duration"))
-                self._trim_cache(path)
-        except Exception as e:
-            if token == self.token:
-                self.on_play_error(token, f"{type(e).__name__}: {str(e)[:200]}")
-
-    @mainthread
-    def on_started(self, token, dur):
-        if token != self.token:
-            return
-        self.state = "playing"
-        if dur and 0 <= self.current < len(self.items):
-            self.items[self.current].duration = int(dur)
-            self.save_queue()
-        self.refresh_now()
-        self.set_status(f"재생 중: {self.items[self.current].title[:40]}")
-
-    @mainthread
-    def on_play_error(self, token, msg):
-        if token != self.token:
-            return
-        self.state = "idle"
-        self.refresh_now()
-        self.set_status(f"⚠ 재생 실패 - {msg}"[:230])
-        if self.current + 1 < len(self.items):
-            Clock.schedule_once(lambda dt: self.next_track(auto=True) if token == self.token else None, 1.5)
-
-    def toggle_play(self):
-        if self.state == "loading":
-            return
-        if self.state == "playing":
-            self.engine.pause()
-            self.state = "paused"
-        elif self.state == "paused":
-            self.engine.resume()
-            self.state = "playing"
-        elif self.items:
-            self.play_index(max(self.current, 0))
-        self.w_play.set_icon("pause" if self.state == "playing" else "play")
-
-    def stop(self):
-        self.token += 1
-        self.engine.stop()
-        self.state = "idle"
-        self.refresh_now()
-
-    def next_track(self, auto=False):
-        if not self.items:
-            return
-        if self.shuffle and len(self.items) > 1:
-            return self.play_index(random.choice([i for i in range(len(self.items)) if i != self.current]))
-        nxt = self.current + 1
-        if nxt >= len(self.items):
-            if self.repeat == 1 or not auto:
-                nxt = 0
-            else:
-                self.stop()
-                self.current = -1
-                self.refresh_list()
-                self.set_status("대기열 재생이 끝났어요")
-                return
-        self.play_index(nxt)
-
-    def prev_track(self):
-        if not self.items:
-            return
-        if self.state in ("playing", "paused") and self.engine.position() > 3000:
-            self.engine.seek(0)
-            return
-        self.play_index((self.current - 1) % len(self.items))
-
-    def toggle_shuffle(self, *a):
-        self.shuffle = not self.shuffle
-        self.style_toggles()
-
-    def toggle_repeat(self, *a):
-        self.repeat = (self.repeat + 1) % 3
-        self.style_toggles()
-
-    def on_seek(self, value):
-        if self.state not in ("playing", "paused"):
-            return
-        dur = self.engine.duration()
-        if dur <= 0 and 0 <= self.current < len(self.items):
-            dur = self.items[self.current].duration * 1000
-        if dur > 0:
-            self.engine.seek(value * dur)
-
-    def tick(self, dt):
-        if self.state not in ("playing", "paused"):
-            return
-        st = self.engine.state()
-        if st == "ended":
-            self.state = "idle"
-            if self.repeat == 2:
-                self.play_index(self.current)
-            else:
-                self.next_track(auto=True)
-            return
-        if st == "error":
-            self.state = "idle"
-            self.refresh_now()
-            self.set_status("⚠ 재생 중 오류가 발생했어요")
-            if self.current + 1 < len(self.items):
-                self.next_track(auto=True)
-            return
-        pos, dur = self.engine.position(), self.engine.duration()
-        if dur <= 0 and 0 <= self.current < len(self.items):
-            dur = self.items[self.current].duration * 1000
-        if dur > 0 and not self.w_seek.dragging:
-            self.w_seek.value = min(pos / dur, 1)
-            self.w_cur.text = fmt_time(pos / 1000)
-            self.w_total.text = fmt_time(dur / 1000)
-        self.w_play.set_icon("pause" if st == "playing" else "play")
-
     # ── yt-dlp 업데이트 ──
     def update_ytdlp(self, *a):
         self.set_status("yt-dlp 최신 버전 받는 중...")
@@ -1034,7 +786,11 @@ class MusicApp(App):
             if not zipfile.is_zipfile(tmp) or os.path.getsize(tmp) < 500_000:
                 raise RuntimeError("받은 파일이 올바르지 않아요")
             os.replace(tmp, dst)
-            self.set_status("✅ 업데이트 완료! 앱을 완전히 종료 후 다시 켜면 적용돼요")
+            if self.be.mode == "service":
+                self.be.send("quit")  # 서비스가 새 버전으로 자동 재시작 (재생 중이던 곡은 멈춰요)
+                self.set_status("✅ 업데이트 완료! 재생 서비스를 새 버전으로 다시 켜는 중... (검색은 앱을 다시 켜면 적용)")
+            else:
+                self.set_status("✅ 업데이트 완료! 앱을 완전히 종료 후 다시 켜면 적용돼요")
         except Exception as e:
             self.set_status(f"⚠ 업데이트 실패: {str(e)[:100]}")
 
