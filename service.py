@@ -18,6 +18,7 @@ class Notifier:
     def __init__(self, brain, data_dir, on_close):
         from jnius import autoclass, cast
         self.autoclass = autoclass
+        self.cast = cast
         self.brain = brain
         self.data_dir = data_dir
         self.on_close = on_close
@@ -139,6 +140,39 @@ class Notifier:
         except Exception:
             self._log("session update error:\n" + traceback.format_exc())
 
+    def _add_action(self, b, res, label, pi):
+        """pyjnius 가 자바 메서드를 못 고르는 경우가 있어서 방법을 바꿔가며 시도"""
+        errs = []
+        try:  # 1) Notification.Action 으로 (API 23+)
+            Icon = self.autoclass("android.graphics.drawable.Icon")
+            AB = self.autoclass("android.app.Notification$Action$Builder")
+            String = self.autoclass("java.lang.String")
+            CharSeq = None
+            try:
+                CharSeq = self.cast("java.lang.CharSequence", String(label))
+            except Exception:
+                CharSeq = label
+            act = AB(Icon.createWithResource(self.svc, res), CharSeq,
+                     self.cast("android.app.PendingIntent", pi)).build()
+            b.addAction(act)
+            return
+        except Exception as e:
+            errs.append("A:" + str(e)[:80])
+        try:  # 2) 예전 방식 + 형 변환
+            String = self.autoclass("java.lang.String")
+            b.addAction(int(res), self.cast("java.lang.CharSequence", String(label)),
+                        self.cast("android.app.PendingIntent", pi))
+            return
+        except Exception as e:
+            errs.append("B:" + str(e)[:80])
+        try:  # 3) 예전 방식 그대로
+            b.addAction(int(res), label, pi)
+            return
+        except Exception as e:
+            errs.append("C:" + str(e)[:80])
+        self._log("addAction all failed: " + " | ".join(errs))
+        raise RuntimeError("addAction " + " | ".join(errs))
+
     def _build(self, snap, title, text, playing, bmp):
         b = self.Builder(self.svc, CHANNEL_ID) if self.sdk >= 26 else self.Builder(self.svc)
         icon = self.svc.getApplicationInfo().icon or self.R.ic_media_play
@@ -158,11 +192,11 @@ class Notifier:
             b.setVisibility(1)  # 잠금화면에도 표시
         except Exception:
             pass
-        b.addAction(self.R.ic_media_previous, "이전", self._action_pi(self.A_PREV, 11))
-        b.addAction(self.R.ic_media_pause if playing else self.R.ic_media_play,
-                    "일시정지" if playing else "재생", self._action_pi(self.A_TOGGLE, 12))
-        b.addAction(self.R.ic_media_next, "다음", self._action_pi(self.A_NEXT, 13))
-        b.addAction(self.R.ic_menu_close_clear_cancel, "닫기", self._action_pi(self.A_CLOSE, 14))
+        self._add_action(b, self.R.ic_media_previous, "이전", self._action_pi(self.A_PREV, 11))
+        self._add_action(b, self.R.ic_media_pause if playing else self.R.ic_media_play,
+                         "일시정지" if playing else "재생", self._action_pi(self.A_TOGGLE, 12))
+        self._add_action(b, self.R.ic_media_next, "다음", self._action_pi(self.A_NEXT, 13))
+        self._add_action(b, self.R.ic_menu_close_clear_cancel, "닫기", self._action_pi(self.A_CLOSE, 14))
         try:
             style = self.autoclass("android.app.Notification$MediaStyle")()
             if self.session is not None:
