@@ -233,15 +233,27 @@ class SeekSlider(Slider):
 
 
 # ───────────── 서비스 / 백엔드 ─────────────
-def start_service(data_dir):
-    """백그라운드 재생 서비스 시작 (이미 켜져 있으면 그대로 둠)"""
+SVC = {}
+
+
+def prepare_service_class():
+    """★ 반드시 화면(메인) 스레드에서 호출 — 일꾼 스레드에서 앱 자바 클래스를 찾으면
+    ClassNotFoundException 이 나기 때문에, 미리 찾아 둔다."""
     from jnius import autoclass
     act = autoclass("org.kivy.android.PythonActivity").mActivity
-    cls = autoclass(act.getPackageName() + ".ServicePlayer")
-    cls.start(act, data_dir)
+    SVC["act"] = act
+    SVC["cls"] = autoclass(act.getPackageName() + ".ServicePlayer")
+
+
+def start_service(data_dir):
+    """백그라운드 재생 서비스 시작 (이미 켜져 있으면 그대로 둠)"""
+    if "cls" not in SVC:
+        prepare_service_class()
+    SVC["cls"].start(SVC["act"], data_dir)
 
 
 class Backend:
+    prep_error = ""
     """서비스(없으면 앱 안의 두뇌)에 명령을 보내고 최신 상태를 받아오는 일꾼 스레드.
     명령이 없을 때는 0.5초마다 상태를 물어봐서 화면을 갱신한다."""
 
@@ -278,7 +290,7 @@ class Backend:
             start_service(self.app.data_dir)
             return True
         except Exception as e:
-            self.why = f"[시작실패 {type(e).__name__}: {str(e)[:120]}]"
+            self.why = f"[시작실패 {type(e).__name__}: {str(e)[:300]}]"
             core.log(self.app.data_dir, f"start_service fail: {e}")
             return False
 
@@ -291,7 +303,7 @@ class Backend:
         return False
 
     def _go_local(self, why=""):
-        engine = core.make_engine(ON_ANDROID)
+        engine = getattr(core, "PREBUILT_ENGINE", None) or core.make_engine(ON_ANDROID)
         self.brain = core.Brain(self.app.data_dir, engine, yt_dlp)
         self.mode = "local"
         self.rev = -1
@@ -308,7 +320,7 @@ class Backend:
         if self._launch() and self._wait_service(30):
             self.mode = "service"
             return
-        self._go_local(self.why or ("[응답없음] " + core.log_tail(self.app.data_dir)))
+        self._go_local(self.why or Backend.prep_error or ("[응답없음] " + core.log_tail(self.app.data_dir)))
 
     def _reconnect(self):
         self.app.set_status("재생 서비스 다시 연결하는 중...")
@@ -394,6 +406,16 @@ class MusicApp(App):
             self.set_status("⚠ yt-dlp 를 불러오지 못했어요")
         else:
             self.set_status(f"제목이나 URL을 입력하세요 (yt-dlp {ytdlp_version()})")
+        if ON_ANDROID:
+            try:
+                prepare_service_class()
+            except Exception as e:
+                core.log(self.data_dir, f"prepare_service_class fail: {e}")
+                Backend.prep_error = f"[클래스찾기실패 {str(e)[:160]}]"
+            try:  # 앱 안 재생(예비)용 엔진도 메인 스레드에서 미리 만들어 둠
+                core.PREBUILT_ENGINE = core.make_engine(True)
+            except Exception as e:
+                core.log(self.data_dir, f"prebuilt engine fail: {e}")
         self.be = Backend(self)
         return self.root_box
 

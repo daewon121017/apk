@@ -123,8 +123,8 @@ class AndroidEngine:
         self.user_paused = False
         self.completed = False
         self._volume = 1.0
-        self._listener = None
         self._lock = threading.Lock()
+        self._listener = self._make_listener()  # 만든 스레드(메인)에서 미리 — 다른 스레드에선 자바 클래스 찾기가 막힘
 
     def _make_listener(self):
         try:
@@ -166,7 +166,6 @@ class AndroidEngine:
         if not still_valid():
             self._release(mp)
             return False
-        self._listener = self._make_listener()
         if self._listener is not None:
             try:
                 mp.setOnCompletionListener(self._listener)
