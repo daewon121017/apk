@@ -7,7 +7,7 @@ source.include_exts = py,png,jpg,kv,atlas,ttf,otf,ttc
 version = 1.0
 
 # yt-dlp 는 순수 파이썬이라 그대로 포함돼요
-requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,pyjnius,android,yt-dlp,certifi,openssl,sqlite3
+requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.1,pyjnius,android,yt-dlp,certifi,openssl,sqlite3
 
 orientation = portrait
 fullscreen = 0
