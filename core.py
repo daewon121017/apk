@@ -550,6 +550,9 @@ class Brain:
         dur = self.engine.duration() or (cur.duration * 1000 if cur else 0)
         if dur > 0:
             self.engine.seek(max(0.0, min(1.0, float(f))) * dur)
+            # 알림창 재생바(미디어 세션)도 바뀐 위치로 다시 맞추게 알림
+            self._changed()
+            threading.Timer(0.5, self._changed).start()
 
     def cmd_move(self, i, d):
         with self.lock:

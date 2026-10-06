@@ -24,6 +24,8 @@ class Notifier:
         self.on_close = on_close
         self.lock = threading.Lock()
         self.last_key = None
+        self.sent_pos = None
+        self.sent_t = 0.0
         self.started = False
 
         PythonService = autoclass("org.kivy.android.PythonService")
@@ -245,10 +247,17 @@ class Notifier:
                 self.art_loading.add(url)
                 threading.Thread(target=self._fetch_art, args=(url,), daemon=True).start()
             key = (state, title, text, bmp is not None)
+            # 앱에서 재생바를 옮기면 실제 위치가 알림창이 계산하던 위치와 어긋남 → 다시 맞춤
+            drift = False
+            if self.sent_pos is not None and state == "playing":
+                expect = self.sent_pos + (time.time() - self.sent_t) * 1000.0
+                drift = abs((s.get("pos") or 0) - expect) > 2500
             with self.lock:
-                if key == self.last_key and not force:
+                if key == self.last_key and not force and not drift:
                     return
                 self.last_key = key
+                self.sent_pos = s.get("pos") or 0
+                self.sent_t = time.time()
                 self._update_session(s, playing, bmp)
                 n = self._build(s, title, text, playing, bmp)
                 # 항상 startForeground 로 올려서 p4a 기본 알림("Player")을 우리 알림으로 교체

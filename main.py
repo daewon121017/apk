@@ -213,10 +213,41 @@ class IconButton(ButtonBehavior, Widget):
 
 
 class SeekSlider(Slider):
-    def __init__(self, on_release_cb, **kw):
+    """기본 슬라이더는 막대/채움선 위치가 서로 어긋나서, 직접 그린다."""
+
+    def __init__(self, on_release_cb, accent=None, track=None, **kw):
+        kw.update(background_width=0, value_track=False, cursor_size=(0, 0))
         super().__init__(**kw)
         self.cb = on_release_cb
         self.dragging = False
+        self._accent = accent or (0.6, 0.4, 1, 1)
+        self._track = track or (1, 1, 1, 0.18)
+        self.bind(pos=self._draw, size=self._draw, value=self._draw, min=self._draw, max=self._draw)
+        self._draw()
+
+    def _draw(self, *a):
+        try:
+            self._draw_inner()
+        except Exception:
+            pass
+
+    def _draw_inner(self):
+        self.canvas.after.clear()
+        pad = self.padding
+        x0, x1 = self.x + pad, self.right - pad
+        if x1 <= x0:
+            return
+        span = (self.max - self.min) or 1
+        frac = max(0.0, min(1.0, (self.value - self.min) / span))
+        cx, cy = x0 + frac * (x1 - x0), self.center_y
+        h, r = dp(4), dp(8)
+        with self.canvas.after:
+            Color(*self._track)
+            RoundedRectangle(pos=(x0, cy - h / 2), size=(x1 - x0, h), radius=[h / 2])
+            Color(*self._accent)
+            if cx > x0:
+                RoundedRectangle(pos=(x0, cy - h / 2), size=(cx - x0, h), radius=[h / 2])
+            Ellipse(pos=(cx - r, cy - r), size=(2 * r, 2 * r))
 
     def on_touch_down(self, touch):
         if self.collide_point(*touch.pos):
@@ -604,8 +635,8 @@ class MusicApp(App):
 
         seek_row = BoxLayout(size_hint_y=None, height=dp(30), spacing=dp(6))
         self.w_cur = lbl("0:00", 11, C(T.text_dim), size_hint_x=None, width=dp(40))
-        self.w_seek = SeekSlider(self.on_seek, min=0, max=1, value=0, value_track=True,
-                                 value_track_color=C(T.accent), cursor_size=(dp(18), dp(18)))
+        self.w_seek = SeekSlider(self.on_seek, accent=C(T.accent), track=tuple(C(T.text_dim)[:3]) + (0.3,),
+                                 min=0, max=1, value=0)
         self.w_total = lbl("0:00", 11, C(T.text_dim), size_hint_x=None, width=dp(40), halign="right")
         seek_row.add_widget(self.w_cur)
         seek_row.add_widget(self.w_seek)
