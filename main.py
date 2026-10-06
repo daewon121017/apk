@@ -232,6 +232,18 @@ class SeekSlider(Slider):
         return res
 
 
+# 유튜브 뮤직 공식 차트 / 큐레이션 플레이리스트
+CHARTS = {
+    "한국 인기곡 Top 100": "PL4fGSI1pDJn6jXS_Tv_N9B8Z0HTRVJE0m",
+    "글로벌 인기곡 Top 100": "PL4fGSI1pDJn6puJdseH2Rt9sMvt9E2M4i",
+    "국내 K-pop 핫리스트": "RDCLAK5uy_l7wbVbkC-dG5fyEQQsBfjm_z3dLAhYyvo",
+    "국내 최신곡": "RDCLAK5uy_mVBAam6Saaqa_DeJRxGkawqqxwPTBrGXM",
+    "국내 최신 OST": "RDCLAK5uy_lN9xj1RQGmBltmvrzTVHMg-vyVt594KYU",
+}
+CHART_PAGE = 20          # 한 번에 그리는 곡 수 (많이 그리면 버벅임)
+CHART_TTL = 30 * 60      # 초 — 이 시간 안에는 다시 안 불러옴
+
+
 # ───────────── 서비스 / 백엔드 ─────────────
 SVC = {}
 
@@ -383,7 +395,11 @@ class MusicApp(App):
         self.state = "idle"  # idle / loading / playing / paused
         self.shuffle = False
         self.repeat = 0  # 0 끔, 1 전체, 2 한곡
-        self.view = "queue"
+        self.view = "chart"
+        self.chart_name = next(iter(CHARTS))
+        self.chart_cache = {}     # 이름 -> (시각, [Track])
+        self.chart_loading = None
+        self.chart_shown = CHART_PAGE
         self.status_text = ""
         self.input_text = ""
         self.incoming_snap = None
@@ -417,6 +433,7 @@ class MusicApp(App):
             except Exception as e:
                 core.log(self.data_dir, f"prebuilt engine fail: {e}")
         self.be = Backend(self)
+        Clock.schedule_once(lambda dt: self.load_chart(), 1.0)
         return self.root_box
 
     def _ask_notification_permission(self):
@@ -631,10 +648,13 @@ class MusicApp(App):
 
         # 탭
         tabs = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(6))
+        self.tab_c = PillButton("차트", C(T.card_hover), C(T.text), fs=13)
+        self.tab_c.bind(on_release=lambda *_: self.set_view("chart"))
         self.tab_q = PillButton("대기열", C(T.card_hover), C(T.text), fs=13)
         self.tab_q.bind(on_release=lambda *_: self.set_view("queue"))
         self.tab_r = PillButton("검색 결과", C(T.card_hover), C(T.text), fs=13)
         self.tab_r.bind(on_release=lambda *_: self.set_view("results"))
+        tabs.add_widget(self.tab_c)
         tabs.add_widget(self.tab_q)
         tabs.add_widget(self.tab_r)
         root.add_widget(tabs)
@@ -665,6 +685,8 @@ class MusicApp(App):
 
     def set_view(self, v):
         self.view = v
+        if v == "chart":
+            self.load_chart()
         self.refresh_list()
 
     def style_toggles(self):
@@ -700,9 +722,12 @@ class MusicApp(App):
         box.clear_widgets()
         self.tab_q.label.text = f"대기열 ({len(self.items)})"
         sel = lambda a: (C(T.accent), WHITE) if a else (C(T.card_hover), C(T.text))
+        self.tab_c.set_colors(*sel(self.view == "chart"))
         self.tab_q.set_colors(*sel(self.view == "queue"))
         self.tab_r.set_colors(*sel(self.view == "results"))
-        if self.view == "queue":
+        if self.view == "chart":
+            self._fill_chart(box)
+        elif self.view == "queue":
             if not self.items:
                 box.add_widget(self._empty("대기열이 비어있어요\n검색해서 곡을 추가해 보세요"))
             for i, t in enumerate(self.items):
@@ -712,6 +737,119 @@ class MusicApp(App):
                 box.add_widget(self._empty("위에서 노래를 검색해 보세요"))
             for t in self.results:
                 box.add_widget(self.result_row(t))
+
+    # ── 인기차트 ──
+    def _fill_chart(self, box):
+        bar = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(6))
+        spin = Spinner(text=self.chart_name, values=list(CHARTS), size_hint=(1, 1),
+                       font_size=sp(12), background_normal="", background_down="",
+                       background_color=C(T.card_hover), color=C(T.text))
+        spin.bind(text=lambda w, v: self.select_chart(v))
+        refresh = PillButton("새로고침", C(T.card_hover), C(T.text), fs=11, size_hint=(None, 1), width=dp(64))
+        refresh.bind(on_release=lambda *_: self.load_chart(force=True))
+        allb = PillButton("전체 담기", C(T.accent), WHITE, fs=11, size_hint=(None, 1), width=dp(68))
+        allb.bind(on_release=lambda *_: self.add_chart_all())
+        bar.add_widget(spin)
+        bar.add_widget(refresh)
+        bar.add_widget(allb)
+        box.add_widget(bar)
+        if self.chart_loading == self.chart_name:
+            box.add_widget(self._empty("차트 불러오는 중..."))
+            return
+        hit = self.chart_cache.get(self.chart_name)
+        if not hit:
+            box.add_widget(self._empty("차트를 불러오지 못했어요\n'새로고침'을 눌러 보세요"))
+            return
+        tracks = hit[1]
+        for i, t in enumerate(tracks[:self.chart_shown]):
+            box.add_widget(self.chart_row(i, t))
+        if self.chart_shown < len(tracks):
+            more = PillButton(f"더 보기 ({min(self.chart_shown, len(tracks))}/{len(tracks)})",
+                              C(T.card_hover), C(T.text), fs=12, size_hint_y=None, height=dp(40))
+            more.bind(on_release=lambda *_: self.chart_more())
+            box.add_widget(more)
+
+    def chart_row(self, i, t):
+        row = Card(C(T.card), orientation="horizontal", size_hint_y=None, height=dp(64),
+                   padding=[dp(6), dp(6)], spacing=dp(6))
+        row.add_widget(lbl(str(i + 1), 15, C(T.accent) if i < 3 else C(T.text_dim), bold=True,
+                           halign="center", size_hint_x=None, width=dp(28)))
+        row.add_widget(AsyncImage(source=t.thumb or "", size_hint=(None, 1), width=dp(76), fit_mode="cover"))
+        info = BoxLayout(orientation="vertical")
+        info.add_widget(lbl(t.title, 13, bold=True))
+        info.add_widget(lbl(f"{t.channel} · {fmt_time(t.duration)}", 11, C(T.text_dim)))
+        row.add_widget(info)
+        p = IconButton("play", WHITE, C(T.accent), size_hint=(None, 1), width=dp(40))
+        p.bind(on_release=lambda *_, t=t: self.add_tracks([t], play=True))
+        a = IconButton("plus", C(T.text), C(T.card_hover), size_hint=(None, 1), width=dp(40))
+        a.bind(on_release=lambda *_, t=t: self.add_tracks([t]))
+        row.add_widget(p)
+        row.add_widget(a)
+        return row
+
+    def select_chart(self, name):
+        if name == self.chart_name or name not in CHARTS:
+            return
+        self.chart_name = name
+        self.chart_shown = CHART_PAGE
+        self.load_chart()
+        self.refresh_list()
+
+    def chart_more(self):
+        self.chart_shown += CHART_PAGE
+        self.refresh_list()
+
+    def load_chart(self, force=False):
+        if yt_dlp is None:
+            return
+        name = self.chart_name
+        hit = self.chart_cache.get(name)
+        if hit and not force and time.time() - hit[0] < CHART_TTL:
+            return
+        if self.chart_loading == name:
+            return
+        self.chart_loading = name
+        self.chart_shown = CHART_PAGE
+        if self.view == "chart":
+            self.refresh_list()
+        threading.Thread(target=self._chart_worker, args=(name,), daemon=True).start()
+
+    def _chart_worker(self, name):
+        pid = CHARTS[name]
+        base = {"quiet": True, "no_warnings": True, "skip_download": True, "cachedir": False,
+                "socket_timeout": 15, "extract_flat": "in_playlist", "playlistend": 100}
+        err = ""
+        for host in ("music.youtube.com", "www.youtube.com"):
+            try:
+                with yt_dlp.YoutubeDL(base) as y:
+                    info = y.extract_info(f"https://{host}/playlist?list={pid}", download=False)
+                tracks = tracks_from_info(info)[:100]
+                if tracks:
+                    self.on_chart(name, tracks, "")
+                    return
+                err = "비어 있어요"
+            except Exception as e:
+                err = str(e)[:120]
+        self.on_chart(name, None, err)
+
+    @mainthread
+    def on_chart(self, name, tracks, err):
+        if self.chart_loading == name:
+            self.chart_loading = None
+        if tracks:
+            self.chart_cache[name] = (time.time(), tracks)
+            self.set_status(f"{name} {len(tracks)}곡")
+        else:
+            self.set_status(f"⚠ 차트 실패: {err}")
+        if self.view == "chart":
+            self.refresh_list()
+
+    def add_chart_all(self):
+        hit = self.chart_cache.get(self.chart_name)
+        if not hit:
+            self.set_status("⚠ 차트를 먼저 불러와 주세요")
+            return
+        self.add_tracks(list(hit[1]))
 
     def _empty(self, text):
         w = lbl(text, 13, C(T.text_dim), halign="center", lines=3, size_hint_y=None, height=dp(110))
